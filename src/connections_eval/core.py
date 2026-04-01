@@ -48,7 +48,7 @@ def _openrouter_chat(messages: list[dict], model: str, is_thinking: bool = False
 
     if is_thinking:
         timeout = 600  # reasoning models need more time
-        payload["reasoning"] = {"effort": "minimal"}
+        payload["reasoning"] = {"effort": "none"}
     else:
         payload["max_tokens"] = 25000
         payload["temperature"] = 0.0

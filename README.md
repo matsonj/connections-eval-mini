@@ -34,7 +34,7 @@ Use `--seed` so every model gets the same puzzles in the same order:
 ```bash
 uv run eval run -m gemini-3-flash -p 5 -s 42
 uv run eval run -m gpt5.4-mini    -p 5 -s 42
-uv run eval run -m sonnet-4.6     -p 5 -s 42
+uv run eval run -m haiku-4.5     -p 5 -s 42
 ```
 
 See all available models with `uv run eval list-models`.
@@ -139,7 +139,7 @@ Replace the game with your task. The structure stays the same: a prompt template
 | gemini-3-flash | Google | `google/gemini-3-flash-preview` |
 | gpt5.4-mini | OpenAI | `openai/gpt-5.4-mini` |
 | haiku-4.5 | Anthropic | `anthropic/claude-haiku-4.5` |
-| sonnet-4.6 | Anthropic | `anthropic/claude-sonnet-4.6` |
+| haiku-4.5 | Anthropic | `anthropic/claude-haiku-4.5` |
 
 Add more by editing `inputs/models.yml` with any [OpenRouter model ID](https://openrouter.ai/models).
 
