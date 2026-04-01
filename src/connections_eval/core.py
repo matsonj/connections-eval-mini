@@ -208,6 +208,8 @@ class ConnectionsGame:
             thinking_ids.add(model_id)
         for name, model_id in data["models"].get("non_thinking", {}).items():
             models[name] = model_id
+        for name, model_id in data["models"].get("free", {}).items():
+            models[name] = model_id
         return models, thinking_ids
 
     # ------------------------------------------------------------------
@@ -277,7 +279,12 @@ class ConnectionsGame:
             response = _openrouter_chat(messages, model_id, is_thinking=is_thinking)
             elapsed_ms = int((time.time() - call_start) * 1000)
 
-            content = (response["choices"][0]["message"].get("content") or "").strip()
+            if "choices" not in response or not response["choices"]:
+                _or_logger.warning(f"No choices in response: {response.get('error', response)}")
+                content = ""
+            else:
+                msg = response["choices"][0]["message"]
+                content = (msg.get("content") or msg.get("reasoning") or "").strip()
             structured = self._parse_structured(content)
 
             prompt_tokens, completion_tokens = _extract_tokens(response)
@@ -372,20 +379,20 @@ class ConnectionsGame:
     # ------------------------------------------------------------------
 
     def _process_guess(self, state: GameState, response: str) -> str:
-        state.turn_count += 1
         words = self._parse_guess_words(response)
-        out_of_turns = state.turn_count >= self.MAX_GUESSES
 
         error = self._validate_guess(state, words)
         if error:
             state.invalid_count += 1
             remaining = self._remaining_words(state)
             msg = f"INVALID_RESPONSE: {error}. Available words: {', '.join(sorted(remaining))}."
-            if state.invalid_count >= self.MAX_INVALID or out_of_turns:
+            if state.invalid_count >= self.MAX_INVALID:
                 state.finished = True
             return msg
 
+        state.turn_count += 1
         state.guess_count += 1
+        out_of_turns = state.turn_count >= self.MAX_GUESSES
 
         for group in state.puzzle.groups:
             if set(words) == set(group.words):

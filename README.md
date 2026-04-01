@@ -27,6 +27,16 @@ uv run eval run -m gemini-3-flash -p 5
 
 This runs 5 puzzles against Gemini 3 Flash and prints solve rate, tokens, cost, and time.
 
+### Free tier
+
+Three free models are included for anyone who doesn't want to add credits to OpenRouter. They work, but they're slow (~10 min per puzzle vs ~10 sec for Gemini Flash):
+
+```bash
+uv run eval run -m step-3.5-flash -p 1
+uv run eval run -m qwen3.6-plus -p 1
+uv run eval run -m nemotron-3-super -p 1
+```
+
 ## Compare models
 
 Use `--seed` so every model gets the same puzzles in the same order:
@@ -134,12 +144,14 @@ Replace the game with your task. The structure stays the same: a prompt template
 
 ### Available models
 
-| Name | Provider | OpenRouter ID |
-|------|----------|---------------|
-| gemini-3-flash | Google | `google/gemini-3-flash-preview` |
-| gpt5.4-mini | OpenAI | `openai/gpt-5.4-mini` |
-| haiku-4.5 | Anthropic | `anthropic/claude-haiku-4.5` |
-| haiku-4.5 | Anthropic | `anthropic/claude-haiku-4.5` |
+| Name | Provider | OpenRouter ID | Free? |
+|------|----------|---------------|-------|
+| gemini-3-flash | Google | `google/gemini-3-flash-preview` | |
+| gpt5.4-mini | OpenAI | `openai/gpt-5.4-mini` | |
+| haiku-4.5 | Anthropic | `anthropic/claude-haiku-4.5` | |
+| step-3.5-flash | StepFun | `stepfun/step-3.5-flash:free` | Yes |
+| qwen3.6-plus | Qwen | `qwen/qwen3.6-plus-preview:free` | Yes |
+| nemotron-3-super | NVIDIA | `nvidia/nemotron-3-super-120b-a12b:free` | Yes |
 
 Add more by editing `inputs/models.yml` with any [OpenRouter model ID](https://openrouter.ai/models).
 
