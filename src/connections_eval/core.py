@@ -9,16 +9,19 @@ import logging
 import os
 import random
 import re
+import tempfile
 import time
 import uuid
 import yaml
 import requests
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 import controllog as cl
+from eval_shared import locked_file
 
 
 # ---------------------------------------------------------------------------
@@ -26,6 +29,8 @@ import controllog as cl
 # ---------------------------------------------------------------------------
 
 _or_logger = logging.getLogger("openrouter")
+_OPENROUTER_LOCK_PATH = Path(tempfile.gettempdir()) / "connections-eval-mini-openrouter.lock"
+_OPENROUTER_LOCK_TIMEOUT_SEC = 900.0
 
 
 def _get_api_key() -> str:
@@ -33,6 +38,55 @@ def _get_api_key() -> str:
     if not key:
         raise ValueError("OPENROUTER_API_KEY not set. Get one at https://openrouter.ai/keys")
     return key
+
+
+def _truncate_text(value: Optional[str], limit: int = 1000) -> Optional[str]:
+    if value is None:
+        return None
+    collapsed = re.sub(r"\s+", " ", value).strip()
+    if not collapsed:
+        return None
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[: max(0, limit - 3)] + "..."
+
+
+def _exception_context(exc: Exception) -> dict[str, Any]:
+    details: dict[str, Any] = {
+        "error_type": type(exc).__name__,
+        "error_message": str(exc) or repr(exc),
+    }
+
+    if isinstance(exc, requests.RequestException):
+        response = exc.response
+        if response is not None:
+            details["status_code"] = response.status_code
+            request_id = response.headers.get("x-request-id") or response.headers.get("request-id")
+            if request_id:
+                details["request_id"] = request_id
+            body_excerpt = _truncate_text(response.text)
+            if body_excerpt:
+                details["response_body_excerpt"] = body_excerpt
+
+    return details
+
+
+@contextmanager
+def _openrouter_request_slot():
+    with locked_file(_OPENROUTER_LOCK_PATH, timeout_sec=_OPENROUTER_LOCK_TIMEOUT_SEC) as locked:
+        yield locked.wait_ms
+
+
+class EvalRunFailedError(RuntimeError):
+    """Raised after a run writes a failure summary."""
+
+    def __init__(self, summary: dict[str, Any]):
+        self.summary = summary
+        puzzle_id = summary.get("failed_puzzle_id")
+        location = f" on puzzle {puzzle_id}" if puzzle_id is not None else ""
+        error_type = summary.get("error_type", "Error")
+        error_message = summary.get("error_message", "run failed")
+        super().__init__(f"Run {summary.get('run_id', '<unknown>')}{location} failed: {error_type}: {error_message}")
 
 
 def _openrouter_chat(messages: list[dict], model: str, is_thinking: bool = False) -> dict:
@@ -56,18 +110,29 @@ def _openrouter_chat(messages: list[dict], model: str, is_thinking: bool = False
     last_err: Exception | None = None
     for attempt in range(4):
         try:
-            resp = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                json=payload, headers=headers, timeout=timeout,
-            )
+            with _openrouter_request_slot() as wait_ms:
+                if wait_ms >= 250:
+                    _or_logger.info(f"Waited {wait_ms}ms for OpenRouter request slot")
+                resp = requests.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    json=payload, headers=headers, timeout=timeout,
+                )
             resp.raise_for_status()
             return resp.json()
-        except requests.RequestException as e:
+        except (requests.RequestException, TimeoutError) as e:
             last_err = e
             if attempt == 3:
                 break
             delay = (2 ** attempt) + random.uniform(0, 0.5)
-            _or_logger.warning(f"Attempt {attempt + 1} failed: {e}. Retrying in {delay:.1f}s...")
+            error_context = _exception_context(e)
+            detail_parts = [f"{error_context['error_type']}: {error_context['error_message']}"]
+            if error_context.get("status_code") is not None:
+                detail_parts.append(f"status={error_context['status_code']}")
+            if error_context.get("request_id"):
+                detail_parts.append(f"request_id={error_context['request_id']}")
+            if error_context.get("response_body_excerpt"):
+                detail_parts.append(f"body={error_context['response_body_excerpt']}")
+            _or_logger.warning(f"Attempt {attempt + 1} failed: {', '.join(detail_parts)}. Retrying in {delay:.1f}s...")
             time.sleep(delay)
     raise last_err  # type: ignore[misc]
 
@@ -231,13 +296,27 @@ class ConnectionsGame:
         if max_puzzles is not None:
             puzzles_to_run = puzzles_to_run[:max_puzzles]
 
-        results = [self._run_puzzle(p, model_name) for p in puzzles_to_run]
+        results: list[PuzzleResult] = []
+        failed_exc: Exception | None = None
+        failed_puzzle_id: Optional[int] = None
+        failure_context: dict[str, Any] = {}
+
+        for puzzle in puzzles_to_run:
+            try:
+                results.append(self._run_puzzle(puzzle, model_name))
+            except Exception as exc:
+                failed_exc = exc
+                failed_puzzle_id = puzzle.id
+                failure_context = _exception_context(exc)
+                break
 
         summary = {
             "run_id": self.run_id,
             "model": model_name,
+            "status": "failed" if failed_exc else "completed",
             "seed": self.seed,
             "puzzles_attempted": len(results),
+            "puzzles_targeted": len(puzzles_to_run),
             "puzzles_solved": sum(r.won for r in results),
             "total_guesses": sum(r.guess_count for r in results),
             "correct_guesses": sum(r.guess_count - r.mistake_count for r in results),
@@ -250,7 +329,16 @@ class ConnectionsGame:
             "total_completion_tokens": sum(r.total_completion_tokens for r in results),
             "total_cost": sum(r.total_cost for r in results),
         }
+
+        if failed_exc is not None:
+            summary.update({
+                "failed_puzzle_id": failed_puzzle_id,
+                **failure_context,
+            })
+
         self.log.write("summary", summary)
+        if failed_exc is not None:
+            raise EvalRunFailedError(summary) from failed_exc
         return summary
 
     # ------------------------------------------------------------------
@@ -274,67 +362,88 @@ class ConnectionsGame:
             run_id=self.run_id, payload={"puzzle_id": puzzle.id},
         )
 
-        while not state.finished:
-            call_start = time.time()
-            response = _openrouter_chat(messages, model_id, is_thinking=is_thinking)
-            elapsed_ms = int((time.time() - call_start) * 1000)
+        try:
+            while not state.finished:
+                call_start = time.time()
+                response = _openrouter_chat(messages, model_id, is_thinking=is_thinking)
+                elapsed_ms = int((time.time() - call_start) * 1000)
 
-            if "choices" not in response or not response["choices"]:
-                _or_logger.warning(f"No choices in response: {response.get('error', response)}")
-                content = ""
-            else:
-                msg = response["choices"][0]["message"]
-                content = (msg.get("content") or msg.get("reasoning") or "").strip()
-            structured = self._parse_structured(content)
+                if "choices" not in response or not response["choices"]:
+                    _or_logger.warning(f"No choices in response: {response.get('error', response)}")
+                    content = ""
+                else:
+                    msg = response["choices"][0]["message"]
+                    content = (msg.get("content") or msg.get("reasoning") or "").strip()
+                structured = self._parse_structured(content)
 
-            prompt_tokens, completion_tokens = _extract_tokens(response)
-            total_prompt += prompt_tokens or 0
-            total_completion += completion_tokens or 0
-            total_tokens += (prompt_tokens or 0) + (completion_tokens or 0)
-            cost = _extract_cost(response)
-            if cost:
-                total_cost += cost
+                prompt_tokens, completion_tokens = _extract_tokens(response)
+                total_prompt += prompt_tokens or 0
+                total_completion += completion_tokens or 0
+                total_tokens += (prompt_tokens or 0) + (completion_tokens or 0)
+                cost = _extract_cost(response)
+                if cost:
+                    total_cost += cost
 
-            result = self._process_guess(state, content)
+                result = self._process_guess(state, content)
 
-            self.log.write("exchange", {
-                "run_id": self.run_id, "model": model_name,
-                "puzzle_id": puzzle.id, "guess_index": state.turn_count,
-                "request": messages[-1]["content"], "response": content,
-                "thinking": structured["thinking"],
-                "guess": structured["guess"],
-                "confidence": structured["confidence"],
-                "latency_ms": elapsed_ms,
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "cost": cost, "result": result,
+                self.log.write("exchange", {
+                    "run_id": self.run_id, "model": model_name,
+                    "puzzle_id": puzzle.id, "guess_index": state.turn_count,
+                    "request": messages[-1]["content"], "response": content,
+                    "thinking": structured["thinking"],
+                    "guess": structured["guess"],
+                    "confidence": structured["confidence"],
+                    "latency_ms": elapsed_ms,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "cost": cost, "result": result,
+                })
+
+                # Controllog: balanced double-entry telemetry
+                exchange_id = cl.new_id()
+                cl.model_prompt(
+                    task_id=task_id, agent_id="agent:connections_eval",
+                    run_id=self.run_id, project_id=self.PROJECT_ID,
+                    provider="openrouter", model=model_id,
+                    prompt_tokens=prompt_tokens or 0,
+                    request_text=messages[-1]["content"],
+                    payload={"puzzle_id": puzzle.id, "guess_index": state.turn_count},
+                    exchange_id=exchange_id,
+                )
+                cl.model_completion(
+                    task_id=task_id, agent_id="agent:connections_eval",
+                    run_id=self.run_id, project_id=self.PROJECT_ID,
+                    provider="openrouter", model=model_id,
+                    completion_tokens=completion_tokens or 0, wall_ms=elapsed_ms,
+                    response_text=content, cost_money=cost,
+                    payload={"puzzle_id": puzzle.id, "guess_index": state.turn_count, "result": result},
+                    exchange_id=exchange_id,
+                )
+
+                # Multi-turn: append response and feedback
+                messages.append({"role": "assistant", "content": content})
+                if not state.finished:
+                    messages.append({"role": "user", "content": result})
+        except Exception as exc:
+            error_context = _exception_context(exc)
+            self.log.write("puzzle_error", {
+                "run_id": self.run_id,
+                "model": model_name,
+                "puzzle_id": puzzle.id,
+                "guess_index": state.turn_count + 1,
+                "request": messages[-1]["content"],
+                **error_context,
             })
-
-            # Controllog: balanced double-entry telemetry
-            exchange_id = cl.new_id()
-            cl.model_prompt(
-                task_id=task_id, agent_id="agent:connections_eval",
-                run_id=self.run_id, project_id=self.PROJECT_ID,
-                provider="openrouter", model=model_id,
-                prompt_tokens=prompt_tokens or 0,
-                request_text=messages[-1]["content"],
-                payload={"puzzle_id": puzzle.id, "guess_index": state.turn_count},
-                exchange_id=exchange_id,
+            cl.state_move(
+                task_id=task_id, from_="WIP", to="FAILED",
+                project_id=self.PROJECT_ID, agent_id="agent:connections_eval",
+                run_id=self.run_id,
+                payload={"puzzle_id": puzzle.id, **{
+                    key: value for key, value in error_context.items()
+                    if key in {"error_type", "error_message", "status_code", "request_id"}
+                }},
             )
-            cl.model_completion(
-                task_id=task_id, agent_id="agent:connections_eval",
-                run_id=self.run_id, project_id=self.PROJECT_ID,
-                provider="openrouter", model=model_id,
-                completion_tokens=completion_tokens or 0, wall_ms=elapsed_ms,
-                response_text=content, cost_money=cost,
-                payload={"puzzle_id": puzzle.id, "guess_index": state.turn_count, "result": result},
-                exchange_id=exchange_id,
-            )
-
-            # Multi-turn: append response and feedback
-            messages.append({"role": "assistant", "content": content})
-            if not state.finished:
-                messages.append({"role": "user", "content": result})
+            raise
 
         time_sec = time.time() - start_time
 
@@ -380,19 +489,19 @@ class ConnectionsGame:
 
     def _process_guess(self, state: GameState, response: str) -> str:
         words = self._parse_guess_words(response)
+        state.turn_count += 1
+        out_of_turns = state.turn_count >= self.MAX_GUESSES
 
         error = self._validate_guess(state, words)
         if error:
             state.invalid_count += 1
             remaining = self._remaining_words(state)
             msg = f"INVALID_RESPONSE: {error}. Available words: {', '.join(sorted(remaining))}."
-            if state.invalid_count >= self.MAX_INVALID:
+            if state.invalid_count >= self.MAX_INVALID or out_of_turns:
                 state.finished = True
             return msg
 
-        state.turn_count += 1
         state.guess_count += 1
-        out_of_turns = state.turn_count >= self.MAX_GUESSES
 
         for group in state.puzzle.groups:
             if set(words) == set(group.words):

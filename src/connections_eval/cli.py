@@ -5,7 +5,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from .core import ConnectionsGame
+from .core import ConnectionsGame, EvalRunFailedError
 
 app = typer.Typer(help="Evaluate AI models on NYT Connections puzzles")
 console = Console()
@@ -30,7 +30,12 @@ def run(
         raise typer.Exit(1)
 
     console.print(f"Running {puzzles} puzzles with [bold]{model}[/bold]...")
-    summary = game.run_evaluation(model, max_puzzles=puzzles)
+    failed = False
+    try:
+        summary = game.run_evaluation(model, max_puzzles=puzzles)
+    except EvalRunFailedError as exc:
+        summary = exc.summary
+        failed = True
 
     # Results table
     table = Table(title=f"Results: {model}")
@@ -39,9 +44,13 @@ def run(
 
     solved = summary["puzzles_solved"]
     attempted = summary["puzzles_attempted"]
+    targeted = summary.get("puzzles_targeted", attempted)
     rate = (solved / attempted * 100) if attempted else 0
 
+    table.add_row("Status", str(summary.get("status", "completed")))
     table.add_row("Puzzles", f"{solved}/{attempted} ({rate:.0f}%)")
+    if targeted != attempted:
+        table.add_row("Scheduled", str(targeted))
     table.add_row("Guesses", f"{summary['total_guesses']} ({summary['correct_guesses']} correct, {summary['incorrect_guesses']} incorrect)")
     table.add_row("Invalid", str(summary["invalid_responses"]))
     table.add_row("Tokens", f"{summary['total_tokens']:,} (prompt: {summary['total_prompt_tokens']:,}, completion: {summary['total_completion_tokens']:,})")
@@ -51,6 +60,12 @@ def run(
     console.print(table)
     console.print(f"\nRun ID: {summary['run_id']}")
     console.print(f"Logs:   {LOGS}/")
+    if failed:
+        failure = summary.get("error_message", "unknown error")
+        if summary.get("status_code") is not None:
+            failure = f"HTTP {summary['status_code']}: {failure}"
+        console.print(f"[red]Run failed on puzzle {summary.get('failed_puzzle_id')}: {failure}[/red]")
+        raise typer.Exit(1)
 
 
 @app.command("list-models")

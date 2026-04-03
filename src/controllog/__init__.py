@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from eval_shared import locked_file
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -65,8 +67,8 @@ def _postings_file() -> Path:
 
 
 def _write_jsonl(path: Path, obj: dict[str, Any]) -> None:
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    with locked_file(path, mode="a", encoding="utf-8") as locked:
+        locked.handle.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
 def _now_iso() -> str:

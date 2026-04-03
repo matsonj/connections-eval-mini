@@ -48,6 +48,7 @@ def build_eval_views(conn: duckdb.DuckDBPyConnection, log_dir: Path = LOGS) -> N
             FROM summaries
         )
         WHERE row_num = 1
+          AND COALESCE(status, 'completed') = 'completed'
     """)
 
     conn.execute("""

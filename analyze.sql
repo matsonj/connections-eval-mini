@@ -29,8 +29,8 @@ FROM (
         ) AS row_num
     FROM summaries
 )
-WHERE row_num = 1;
-
+WHERE row_num = 1
+  AND COALESCE(status, 'completed') = 'completed';
 -- Exchange rows from completed runs only
 CREATE OR REPLACE VIEW completed_exchanges AS
 SELECT e.*

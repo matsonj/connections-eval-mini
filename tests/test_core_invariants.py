@@ -6,9 +6,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 import duckdb
+import requests
 
 from analyze import build_eval_views
-from connections_eval.core import ConnectionsGame, GameState, JsonLog, Puzzle, PuzzleGroup, _new_run_token
+from connections_eval.core import ConnectionsGame, EvalRunFailedError, GameState, JsonLog, Puzzle, PuzzleGroup, _new_run_token
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -189,6 +190,30 @@ class CoreInvariantTests(unittest.TestCase):
                 {
                     "timestamp": "2026-03-31T12:00:02Z",
                     "message": "exchange",
+                    "run_id": "failed-run",
+                    "model": "model-a",
+                    "puzzle_id": 1,
+                    "guess_index": 1,
+                    "result": "INCORRECT",
+                    "latency_ms": 200,
+                    "prompt_tokens": 20,
+                    "completion_tokens": 10,
+                    "cost": 0.02,
+                },
+                {
+                    "timestamp": "2026-03-31T12:00:03Z",
+                    "message": "summary",
+                    "run_id": "failed-run",
+                    "model": "model-a",
+                    "status": "failed",
+                    "puzzles_attempted": 0,
+                    "puzzles_solved": 0,
+                    "avg_time_sec": 0.0,
+                    "total_cost": 0.0,
+                },
+                {
+                    "timestamp": "2026-03-31T12:00:04Z",
+                    "message": "exchange",
                     "run_id": "partial-run",
                     "model": "model-a",
                     "puzzle_id": 1,
@@ -209,9 +234,49 @@ class CoreInvariantTests(unittest.TestCase):
             completed_runs = conn.execute("SELECT COUNT(DISTINCT run_id) FROM completed_exchanges").fetchone()[0]
             completed_run_id = conn.execute("SELECT run_id FROM completed_exchanges").fetchone()[0]
 
-            self.assertEqual(total_runs, 2)
+            self.assertEqual(total_runs, 3)
             self.assertEqual(completed_runs, 1)
             self.assertEqual(completed_run_id, "complete-run")
+
+    def test_failed_run_writes_error_rows_and_summary(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_dir = Path(tmpdir)
+            game = ConnectionsGame(INPUTS, log_dir, seed=1)
+            game.puzzles = [make_puzzle()]
+
+            response = requests.Response()
+            response.status_code = 429
+            response.encoding = "utf-8"
+            response.headers["x-request-id"] = "req_test_123"
+            response._content = b'{"error":"rate limit"}'
+            response.url = "https://openrouter.ai/api/v1/chat/completions"
+            response.request = requests.Request("POST", response.url).prepare()
+            error = requests.HTTPError("429 Client Error: Too Many Requests", response=response)
+
+            with (
+                patch("connections_eval.core._openrouter_chat", side_effect=error),
+                patch("connections_eval.core.cl.state_move") as mock_state_move,
+                patch("connections_eval.core.cl.model_prompt"),
+                patch("connections_eval.core.cl.model_completion"),
+            ):
+                with self.assertRaises(EvalRunFailedError) as ctx:
+                    game.run_evaluation("haiku-4.5", max_puzzles=1)
+
+            summary = ctx.exception.summary
+            log_path = next(log_dir.glob("connections_eval_*.jsonl"))
+            rows = [json.loads(line) for line in log_path.read_text().splitlines()]
+
+            self.assertEqual(summary["status"], "failed")
+            self.assertEqual(summary["puzzles_attempted"], 0)
+            self.assertEqual(summary["puzzles_targeted"], 1)
+            self.assertEqual(summary["failed_puzzle_id"], 9999)
+            self.assertEqual(summary["status_code"], 429)
+            self.assertEqual(summary["request_id"], "req_test_123")
+            self.assertIn("rate limit", summary["response_body_excerpt"])
+            self.assertEqual([row["message"] for row in rows], ["puzzle_error", "summary"])
+            self.assertEqual(rows[0]["guess_index"], 1)
+            self.assertEqual(rows[-1]["status"], "failed")
+            self.assertEqual(mock_state_move.call_args_list[-1].kwargs["to"], "FAILED")
 
 
 if __name__ == "__main__":
